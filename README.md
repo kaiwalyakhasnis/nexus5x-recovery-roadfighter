@@ -1,7 +1,7 @@
 # Road Fighter in the Nexus 5X recovery
 
 <p align="center">
-  <img src="media/demo.gif" alt="Nexus 5X: fastboot boot of the recovery image, Road Fighter starting with recovery, steering, game over and restart" width="480">
+  <img src="media/demo.gif" alt="Nexus 5X: fastboot boot of the recovery image, Road Fighter starting with recovery, steering, game over and restart" width="320">
   <br>
   <sub>Road Fighter in recovery on a Nexus 5X, RAM-booted with <code>fastboot boot</code> (boot sped up 3×, gameplay 1.33×). <a href="media/demo.mp4">Full-quality video</a></sub>
 </p>
