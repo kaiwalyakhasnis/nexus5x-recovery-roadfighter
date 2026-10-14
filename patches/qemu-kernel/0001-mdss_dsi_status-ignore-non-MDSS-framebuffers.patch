@@ -1,0 +1,13 @@
+--- a/drivers/video/msm/mdss/mdss_dsi_status.c
++++ b/drivers/video/msm/mdss/mdss_dsi_status.c
+@@ -125,6 +125,10 @@
+ 		return NOTIFY_BAD;
+ 	}
+ 
++	/* bullhead-qemu: only MDSS framebuffers carry msm_fb_data_type in ->par (simplefb doesn't) */
++	if (!evdata->info || strncmp(evdata->info->fix.id, "mdssfb", 6))
++		return NOTIFY_DONE;
++
+ 	mfd = evdata->info->par;
+ 	ctrl_pdata = container_of(dev_get_platdata(&mfd->pdev->dev),
+ 				struct mdss_dsi_ctrl_pdata, panel_data);

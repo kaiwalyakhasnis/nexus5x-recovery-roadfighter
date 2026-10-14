@@ -1,0 +1,1244 @@
+From 9d7673fee01558e0fe2ec79ffd0058e590a2af54 Mon Sep 17 00:00:00 2001
+From: kk <kaiwalyakhasnis57@gmail.com>
+Date: Wed, 14 Oct 2026 15:28:44 +0900
+Subject: [PATCH 1/2] recovery: add Road Fighter game to the Advanced menu
+
+Port of https://github.com/kaiwalyakhasnis/Road-Fighter-Compose to
+recovery's minui: same rules (road 1:2.5:0.5, 20dp steps, collisions,
+score per passed car, level every 25 points with faster road and tinted
+verges), composed in a private RGBA buffer with clipping and alpha and
+pushed with one gr_blit()/gr_flip() per frame.
+
+- roadfighter/: game code, assets (road PNGs from the app, car vector
+  drawables rasterized with tools/vec2png.py), installed at
+  /etc/roadfighter in the recovery ramdisk (res/* is wiped by the
+  recovery image build).
+- RecoveryUI::PollInputEvent(): non-blocking event read for the game loop.
+- Advanced menu: "Play Road Fighter".
+
+Controls: Left/Right or Volume Up/Down or tap a screen half to steer;
+Power/Enter/tap to play again; Back/Esc (or a volume key on the game
+over screen) to exit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I4014aa54a5cf8cb4c574e04d7820058de218d593
+---
+ Android.mk                      |  16 +-
+ device.cpp                      |   2 +
+ device.h                        |   1 +
+ recovery.cpp                    |   5 +
+ roadfighter/Android.mk          |  18 ++
+ roadfighter/res/blue_car.png    | Bin 0 -> 382 bytes
+ roadfighter/res/player_car.png  | Bin 0 -> 375 bytes
+ roadfighter/res/road_center.png | Bin 0 -> 7605 bytes
+ roadfighter/res/road_left.png   | Bin 0 -> 9876 bytes
+ roadfighter/res/road_right.png  | Bin 0 -> 5696 bytes
+ roadfighter/roadfighter.cpp     | 487 ++++++++++++++++++++++++++++++++
+ roadfighter/roadfighter.h       |  14 +
+ roadfighter/tools/vec2png.py    |  45 +++
+ ui.cpp                          |  26 ++
+ ui.h                            |   5 +
+ 15 files changed, 617 insertions(+), 2 deletions(-)
+ create mode 100644 roadfighter/Android.mk
+ create mode 100644 roadfighter/res/blue_car.png
+ create mode 100644 roadfighter/res/player_car.png
+ create mode 100644 roadfighter/res/road_center.png
+ create mode 100644 roadfighter/res/road_left.png
+ create mode 100644 roadfighter/res/road_right.png
+ create mode 100644 roadfighter/roadfighter.cpp
+ create mode 100644 roadfighter/roadfighter.h
+ create mode 100644 roadfighter/tools/vec2png.py
+
+diff --git a/Android.mk b/Android.mk
+index 43ec7d35..9e19444c 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -68,6 +68,10 @@ LOCAL_STATIC_LIBRARIES := \
+ 
+ include $(BUILD_STATIC_LIBRARY)
+ 
++# Road Fighter assets (installed by roadfighter/Android.mk, required by recovery below)
++ROADFIGHTER_RES_FILES := road_left.png road_center.png road_right.png player_car.png blue_car.png
++ROADFIGHTER_RES_MODULES := $(addprefix roadfighter_,$(ROADFIGHTER_RES_FILES))
++
+ # recovery (static executable)
+ # ===============================
+ include $(CLEAR_VARS)
+@@ -83,7 +87,13 @@ LOCAL_SRC_FILES := \
+     ui.cpp \
+     vr_ui.cpp \
+     wear_ui.cpp \
+-    voldclient.cpp
++    voldclient.cpp \
++    roadfighter/roadfighter.cpp
++
++# Road Fighter draws into its own frame buffer, so it needs minui's pixel byte order.
++ifneq ($(filter ABGR_8888 BGRA_8888,$(subst ",,$(TARGET_RECOVERY_PIXEL_FORMAT))),)
++LOCAL_CFLAGS += -DROADFIGHTER_BGR
++endif
+ 
+ # External tools
+ LOCAL_SRC_FILES += \
+@@ -302,7 +312,8 @@ LOCAL_REQUIRED_MODULES += \
+     toybox_static \
+     recovery_mkshrc \
+     minivold \
+-    bu_recovery
++    bu_recovery \
++    $(ROADFIGHTER_RES_MODULES)
+ 
+ # Symlinks
+ RECOVERY_TOOLS := \
+@@ -484,6 +495,7 @@ include \
+     $(LOCAL_PATH)/minui/Android.mk \
+     $(LOCAL_PATH)/otafault/Android.mk \
+     $(LOCAL_PATH)/otautil/Android.mk \
++    $(LOCAL_PATH)/roadfighter/Android.mk \
+     $(LOCAL_PATH)/tests/Android.mk \
+     $(LOCAL_PATH)/tools/Android.mk \
+     $(LOCAL_PATH)/uncrypt/Android.mk \
+diff --git a/device.cpp b/device.cpp
+index 13eb7d2b..50955f7a 100644
+--- a/device.cpp
++++ b/device.cpp
+@@ -82,6 +82,7 @@ static const MenuItem ADVANCED_MENU_ITEMS[] = {
+   MenuItem("Mount system"),
+   MenuItem("View logs"),
+   MenuItem("Run graphics test"),
++  MenuItem("Play Road Fighter"),
+   MenuItem("Power off"),
+ };
+ static const MenuItemVector advanced_menu_items_ =
+@@ -93,6 +94,7 @@ static const Device::BuiltinAction ADVANCED_MENU_ACTIONS[] = {
+   Device::MOUNT_SYSTEM,
+   Device::VIEW_RECOVERY_LOGS,
+   Device::RUN_GRAPHICS_TEST,
++  Device::ROAD_FIGHTER,
+   Device::SHUTDOWN,
+ };
+ static const Device::MenuActionVector advanced_menu_actions_ =
+diff --git a/device.h b/device.h
+index e53ee121..92e39563 100644
+--- a/device.h
++++ b/device.h
+@@ -70,6 +70,7 @@ class Device : public VoldWatcher {
+     VIEW_RECOVERY_LOGS = 22,
+     RUN_GRAPHICS_TEST = 23,
+     SHUTDOWN = 24,
++    ROAD_FIGHTER = 25,
+   };
+ 
+   typedef std::vector<MenuItem> MenuItemVector;
+diff --git a/recovery.cpp b/recovery.cpp
+index df92a0d5..3abbbd66 100644
+--- a/recovery.cpp
++++ b/recovery.cpp
+@@ -67,6 +67,7 @@
+ #include "minadbd/minadbd.h"
+ #include "minui/minui.h"
+ #include "otautil/DirUtil.h"
++#include "roadfighter/roadfighter.h"
+ #include "roots.h"
+ #include "rotate_logs.h"
+ #include "screen_ui.h"
+@@ -1359,6 +1360,10 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
+         run_graphics_test();
+         break;
+ 
++      case Device::ROAD_FIGHTER:
++        run_road_fighter(ui);
++        break;
++
+       case Device::MOUNT_SYSTEM:
+         // For a system image built with the root directory (i.e. system_root_image == "true"), we
+         // mount it to /system_root, and symlink /system to /system_root/system to make adb shell
+diff --git a/roadfighter/Android.mk b/roadfighter/Android.mk
+new file mode 100644
+index 00000000..fe780b2b
+--- /dev/null
++++ b/roadfighter/Android.mk
+@@ -0,0 +1,18 @@
++# Road Fighter game assets, installed into the recovery ramdisk at /etc/roadfighter
++# (not /res: the recovery image build wipes res/* and recopies the stock resources).
++# The game code itself (roadfighter.cpp) is built into the recovery executable.
++
++LOCAL_PATH := $(call my-dir)
++
++define roadfighter-res
++include $$(CLEAR_VARS)
++LOCAL_MODULE := roadfighter_$(1)
++LOCAL_MODULE_STEM := $(1)
++LOCAL_MODULE_CLASS := ETC
++LOCAL_MODULE_TAGS := optional
++LOCAL_MODULE_PATH := $$(TARGET_RECOVERY_ROOT_OUT)/etc/roadfighter
++LOCAL_SRC_FILES := res/$(1)
++include $$(BUILD_PREBUILT)
++endef
++
++$(foreach f,$(ROADFIGHTER_RES_FILES),$(eval $(call roadfighter-res,$(f))))
+diff --git a/roadfighter/res/blue_car.png b/roadfighter/res/blue_car.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..17e8078a5d80d324fdb1360a7e27d072e8f59dfc
+GIT binary patch
+literal 382
+zcmeAS@N?(olHy`uVBq!ia0vp^wm=-h!3HD^XWCaYFfh7$x;TbZ%y~P@n(wfJ0Bhk9
+z!JsF0dNEJ-0I{835zCS%3>$=IeD(kAR^+U7d$Fkh1~nGNmK~PPr{^E9{99@F=X2fE
+zw%PYGx%>CZ7r3hU9-L!;@AG!C<ayI?*nFQjb(#t5k}m>>Di?-!m+w&2*3IPdc$x8c
+zgU|V#oTz=f_niq;0E=ZBpYSqS)3ZwA`PHv=TOndEmnnQ+Ceq{HBE9L-q-70L%$jwM
+z1smsSFO7@8X6_sobxCBxCEv`cL8p#Y{YtwR9onpOX9CDR&)^9l!eD8z*G<vnGwZAu
+zc>zUQ-^tx{yzLwgR<dNv%&?{F+s$q37N*s6OnP=<i?7vdju2+6CwYoM7Xn?AC9bsf
+z;j`NPauD?;m-SY+Yp;C<<$douGyB|u%QpkKJ%b&*lz%cGn&p)F*5~bFV7M}Py85}S
+Ib4q9e09n+d{Qv*}
+
+literal 0
+HcmV?d00001
+
+diff --git a/roadfighter/res/player_car.png b/roadfighter/res/player_car.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..91c965ff9a83aea3ae18d495d3b04e435bdbf039
+GIT binary patch
+literal 375
+zcmeAS@N?(olHy`uVBq!ia0vp^wm=-h!3HD^XWCaYFfiJAx;TbZ%y~P@o3Gh`ht>C?
+zLF|`*>4_H?H(X*?nfA%BG3%aArh;T-WzpgpoQg;0Z{EV=r@8dP$?1>2_-4O)So)R4
+z-{q3Xoxj3+>$3~LRTgHvmpS3(J&P%*%5b;-maI-b^OU8kzKoiCEA8hzpJ^L?{p+Qp
+zXP6>0J%b&*b~}bGT4=oL(K<H)h=4h3q{-5RIf8i*BW~F$cfZ@0rOA5pLDZ({6Q@oy
+zVO>%Z>|Q40{_V~0m-(;mRexWtn{u*a&6Xva9<!Rj#BIN+yVmEPZh!y&2J2Y{h_S-w
+zP8dx9>)vvE;#rO<p4atDZse<F^7*!3<KNGnzs&oc-K1p=Q_7mxY!h6`yZy!c-Ug7F
+z3QK4IOYQxzB##eb4u5&dMIN@em#MPiGd*W92T7ge@4w}?Af|5PRA7KIc)I$ztaD0e
+F0sz`<qE7$-
+
+literal 0
+HcmV?d00001
+
+diff --git a/roadfighter/res/road_center.png b/roadfighter/res/road_center.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcff8268b0b89b478b72d9813fd2036cf6a0392a
+GIT binary patch
+literal 7605
+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
+TwlypNq0`=Hpm|r_>C}G#v#CEa
+
+literal 0
+HcmV?d00001
+
+diff --git a/roadfighter/res/road_left.png b/roadfighter/res/road_left.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7997e5baa2e734f4cecabe7ecb5b5975c55fbb3a
+GIT binary patch
+literal 9876
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/roadfighter/res/road_right.png b/roadfighter/res/road_right.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..cde97124a2b32e699bcbd3f0a47d4afe9aac05e2
+GIT binary patch
+literal 5696
+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
+Ovrtn_2U4M875*R2zgKGj
+
+literal 0
+HcmV?d00001
+
+diff --git a/roadfighter/roadfighter.cpp b/roadfighter/roadfighter.cpp
+new file mode 100644
+index 00000000..a15fa3bb
+--- /dev/null
++++ b/roadfighter/roadfighter.cpp
+@@ -0,0 +1,487 @@
++/*
++ * Road Fighter: a port of https://github.com/kaiwalyakhasnis/Road-Fighter-Compose to recovery.
++ *
++ * Game rules follow the Compose version:
++ *  - the road (left verge 1 : road 2.5 : right verge 0.5) and a blue car scroll down by one screen
++ *    height per cycle; the cycle time depends on the level,
++ *  - each Left/Right press moves the player car by 20dp,
++ *  - touching a verge or the blue car ends the game,
++ *  - every blue car that passes the player scores 1, and every 25 points is a new level (max 6),
++ *    which also speeds up the road and tints the verges.
++ *
++ * minui's gr_blit() is an unclipped opaque copy, so each frame is composed in a private RGBA buffer
++ * (clipping + alpha for the cars) and pushed with a single gr_blit() + gr_flip().
++ *
++ * Controls: Left/Right arrows, Volume Up/Down, or tap the left/right half of the screen.
++ * Game over: Power / Enter / tap plays again; Back / Esc (anytime) or a volume key exits.
++ */
++
++#include "roadfighter/roadfighter.h"
++
++#include <linux/input.h>
++#include <math.h>
++#include <png.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include "minui/minui.h"
++#include "ui.h"
++
++namespace {
++
++const char* kResDir = "/etc/roadfighter/";
++
++// Phone width in dp (1080px at 420dpi); all game distances are in dp like the Compose version.
++const float kScreenWidthDp = 411.43f;
++const float kCarWidthDp = 23.197025f;
++const float kCarHeightDp = 32.0f;
++const float kPlayerStepDp = 20.0f;
++const float kPlayerBottomPaddingDp = 250.0f;
++const int kBlueCarMinDp = 120;
++const int kBlueCarMaxDp = 250;
++const float kButtonSizeDp = 75.0f;
++const float kButtonPadHDp = 10.0f;
++const float kButtonPadVDp = 100.0f;
++const float kDashPadDp = 20.0f;
++
++const int kMaxLevel = 6;
++const int kPointsPerLevel = 25;
++const int kLevelSpeedMs[kMaxLevel] = { 1500, 1400, 1300, 1200, 1000, 750 };
++// Verge tint per level (Compose ColorFilter.tint(color, BlendMode.Color)); alpha 0 = no tint.
++const uint32_t kLevelTint[kMaxLevel] = { 0x00000000, 0xFF0000FF, 0xFFEB6E65,
++                                         0x00000000, 0xFF0000FF, 0xFFEB6E65 };
++
++const int kFrameMs = 33;
++const int kGameOverInputDelayMs = 600;
++
++int64_t now_ms() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
++}
++
++// RGBA image, 4 bytes per pixel in R,G,B,A order.
++struct Image {
++  int w = 0;
++  int h = 0;
++  std::vector<uint8_t> px;
++
++  Image() {}
++  Image(int w_, int h_) : w(w_), h(h_), px(static_cast<size_t>(w_) * h_ * 4, 0) {}
++  uint8_t* at(int x, int y) { return &px[(static_cast<size_t>(y) * w + x) * 4]; }
++  const uint8_t* at(int x, int y) const { return &px[(static_cast<size_t>(y) * w + x) * 4]; }
++};
++
++bool load_png(const std::string& name, Image* out) {
++  std::string path = kResDir + name;
++  png_image png;
++  memset(&png, 0, sizeof(png));
++  png.version = PNG_IMAGE_VERSION;
++  if (!png_image_begin_read_from_file(&png, path.c_str())) {
++    printf("roadfighter: can't read %s: %s\n", path.c_str(), png.message);
++    return false;
++  }
++  png.format = PNG_FORMAT_RGBA;
++  *out = Image(png.width, png.height);
++  if (!png_image_finish_read(&png, nullptr, out->px.data(), 0, nullptr)) {
++    printf("roadfighter: can't decode %s: %s\n", path.c_str(), png.message);
++    png_image_free(&png);
++    return false;
++  }
++  return true;
++}
++
++Image scale_nearest(const Image& src, int w, int h) {
++  Image dst(std::max(w, 1), std::max(h, 1));
++  for (int y = 0; y < dst.h; ++y) {
++    int sy = y * src.h / dst.h;
++    for (int x = 0; x < dst.w; ++x) {
++      memcpy(dst.at(x, y), src.at(x * src.w / dst.w, sy), 4);
++    }
++  }
++  return dst;
++}
++
++// W3C "color" blend mode: hue and saturation of the tint, luminosity of the source.
++Image tint_color_blend(const Image& src, uint32_t argb) {
++  if ((argb >> 24) == 0) return src;
++  float tr = ((argb >> 16) & 0xff) / 255.0f, tg = ((argb >> 8) & 0xff) / 255.0f,
++        tb = (argb & 0xff) / 255.0f;
++  float tlum = 0.3f * tr + 0.59f * tg + 0.11f * tb;
++  Image dst = src;
++  for (size_t i = 0; i < dst.px.size(); i += 4) {
++    float lum = (0.3f * dst.px[i] + 0.59f * dst.px[i + 1] + 0.11f * dst.px[i + 2]) / 255.0f;
++    float d = lum - tlum;
++    float c[3] = { tr + d, tg + d, tb + d };
++    // ClipColor
++    float n = std::min({ c[0], c[1], c[2] }), x = std::max({ c[0], c[1], c[2] });
++    for (float& v : c) {
++      if (n < 0.0f) v = lum + (v - lum) * lum / (lum - n);
++      if (x > 1.0f) v = lum + (v - lum) * (1.0f - lum) / (x - lum);
++      dst.px[i + (&v - c)] = static_cast<uint8_t>(std::min(std::max(v, 0.0f), 1.0f) * 255.0f + 0.5f);
++    }
++  }
++  return dst;
++}
++
++bool point_in_polygon(const std::vector<float>& xy, float x, float y) {
++  bool in = false;
++  size_t n = xy.size() / 2;
++  for (size_t i = 0, j = n - 1; i < n; j = i++) {
++    float xi = xy[2 * i], yi = xy[2 * i + 1], xj = xy[2 * j], yj = xy[2 * j + 1];
++    if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) in = !in;
++  }
++  return in;
++}
++
++// Gray round button with a black chevron, like the Compose IconButton with
++// Icons.Default.KeyboardArrowLeft/Right.
++Image make_button(int size, float border, bool right) {
++  // Material "keyboard_arrow_left" path in a 24x24 viewport.
++  std::vector<float> chevron = { 15.41f, 16.59f, 10.83f, 12.0f, 15.41f, 7.41f,
++                                 14.0f,  6.0f,   8.0f,   12.0f, 14.0f,  18.0f };
++  if (right) {
++    for (size_t i = 0; i < chevron.size(); i += 2) chevron[i] = 24.0f - chevron[i];
++  }
++  Image img(size, size);
++  float r = size / 2.0f;
++  for (int y = 0; y < size; ++y) {
++    for (int x = 0; x < size; ++x) {
++      float cx = x + 0.5f - r, cy = y + 0.5f - r;
++      float dist = sqrtf(cx * cx + cy * cy);
++      if (dist > r) continue;
++      uint8_t* p = img.at(x, y);
++      bool black = dist > r - border ||
++                   point_in_polygon(chevron, (x + 0.5f) * 24.0f / size, (y + 0.5f) * 24.0f / size);
++      uint8_t v = black ? 0x00 : 0x88;
++      p[0] = p[1] = p[2] = v;
++      p[3] = 0xff;
++    }
++  }
++  return img;
++}
++
++struct RectF {
++  float left, top, right, bottom;
++  // Same as Compose Rect.overlaps().
++  bool overlaps(const RectF& o) const {
++    return !(right <= o.left || o.right <= left || bottom <= o.top || o.bottom <= top);
++  }
++};
++
++class Game {
++ public:
++  explicit Game(RecoveryUI* ui) : ui_(ui) {}
++
++  bool Init();
++  void Run();
++
++ private:
++  enum class Status { RUNNING, FINISHED };
++  enum class Input { NONE, LEFT, RIGHT, RESTART, EXIT };
++
++  float dp(float v) const { return v * density_; }
++  int level_index() const { return std::min(std::max(level_, 1), kMaxLevel) - 1; }
++
++  void Reset();
++  void Update(int64_t dt_ms);
++  Input Translate(const RecoveryUI::InputEvent& ev) const;
++  void Render();
++  void Present();
++
++  void Blit(const Image& img, int dx, int dy, bool opaque);
++
++  RecoveryUI* ui_;
++  int width_ = 0;
++  int height_ = 0;
++  float density_ = 1.0f;
++
++  Image road_[3][kMaxLevel];  // [left, center, right][level], pre-scaled and pre-tinted
++  int road_x_[3] = {};
++  Image player_car_;
++  Image blue_car_;
++  Image button_left_;
++  Image button_right_;
++
++  Image frame_;
++  GRSurface surface_ = {};
++
++  Status status_ = Status::RUNNING;
++  int64_t finished_at_ms_ = 0;
++  int score_ = 0;
++  int level_ = 1;
++  float player_offset_dp_ = 0.0f;
++  float anim_ = 0.0f;  // 0..1 progress of the road/blue car through one screen height
++  float blue_x_ = 0.0f;
++  float blue_target_x_ = 0.0f;
++  bool blue_counted_ = false;
++};
++
++bool Game::Init() {
++  width_ = gr_fb_width();
++  height_ = gr_fb_height();
++  density_ = width_ / kScreenWidthDp;
++
++  Image road_src[3], player, blue;
++  if (!load_png("road_left.png", &road_src[0]) || !load_png("road_center.png", &road_src[1]) ||
++      !load_png("road_right.png", &road_src[2]) || !load_png("player_car.png", &player) ||
++      !load_png("blue_car.png", &blue)) {
++    return false;
++  }
++
++  // Row weights 1 : 2.5 : 0.5, each section stretched to the full screen height.
++  int edges[4] = { 0, width_ / 4, width_ * 7 / 8, width_ };
++  for (int s = 0; s < 3; ++s) {
++    road_x_[s] = edges[s];
++    // Row 0 of the road PNGs is a dark line (the Compose version hides it by overlapping the two
++    // copies by 2dp); drop it so the road tiles seamlessly.
++    Image& src = road_src[s];
++    if (src.h > 1) {
++      src.px.erase(src.px.begin(), src.px.begin() + src.w * 4);
++      --src.h;
++    }
++    Image scaled = scale_nearest(src, edges[s + 1] - edges[s], height_);
++    for (int l = 0; l < kMaxLevel; ++l) {
++      // The Compose version only tints the verges.
++      road_[s][l] = (s == 1) ? scaled : tint_color_blend(scaled, kLevelTint[l]);
++    }
++  }
++
++  int car_w = static_cast<int>(dp(kCarWidthDp) + 0.5f);
++  int car_h = static_cast<int>(dp(kCarHeightDp) + 0.5f);
++  player_car_ = scale_nearest(player, car_w, car_h);
++  blue_car_ = scale_nearest(blue, car_w, car_h);
++
++  int button = static_cast<int>(dp(kButtonSizeDp));
++  button_left_ = make_button(button, std::max(dp(1.0f), 1.0f), false);
++  button_right_ = make_button(button, std::max(dp(1.0f), 1.0f), true);
++
++  frame_ = Image(width_, height_);
++  surface_.width = width_;
++  surface_.height = height_;
++  surface_.row_bytes = width_ * 4;
++  surface_.pixel_bytes = 4;
++  surface_.data = frame_.px.data();
++  return true;
++}
++
++void Game::Reset() {
++  status_ = Status::RUNNING;
++  score_ = 0;
++  level_ = 1;
++  player_offset_dp_ = 0.0f;
++  anim_ = 0.0f;
++  blue_target_x_ = dp(kBlueCarMinDp + rand() % (kBlueCarMaxDp - kBlueCarMinDp + 1));
++  blue_x_ = blue_target_x_;
++  blue_counted_ = false;
++}
++
++void Game::Update(int64_t dt_ms) {
++  anim_ += static_cast<float>(dt_ms) / kLevelSpeedMs[level_index()];
++  if (anim_ >= 1.0f) {
++    anim_ = fmodf(anim_, 1.0f);
++    blue_target_x_ = dp(kBlueCarMinDp + rand() % (kBlueCarMaxDp - kBlueCarMinDp + 1));
++  }
++  // animateDpAsState's spring, approximated with an exponential approach.
++  blue_x_ += (blue_target_x_ - blue_x_) * (1.0f - expf(-dt_ms / 80.0f));
++
++  RectF blue = { blue_x_, height_ * anim_, blue_x_ + blue_car_.w, height_ * anim_ + blue_car_.h };
++  float px = (width_ - player_car_.w) / 2.0f + dp(player_offset_dp_);
++  float py = height_ - dp(kPlayerBottomPaddingDp) - player_car_.h;
++  RectF player = { px, py, px + player_car_.w, py + player_car_.h };
++  RectF left_verge = { 0.0f, 0.0f, static_cast<float>(road_x_[1]), static_cast<float>(height_) };
++  RectF right_verge = { static_cast<float>(road_x_[2]), 0.0f, static_cast<float>(width_),
++                        static_cast<float>(height_) };
++
++  if (player.overlaps(left_verge) || player.overlaps(right_verge) || player.overlaps(blue)) {
++    status_ = Status::FINISHED;
++    finished_at_ms_ = now_ms();
++    return;
++  }
++
++  if (!blue_counted_ && blue.top >= player.top) {
++    blue_counted_ = true;
++    ++score_;
++    if (score_ % kPointsPerLevel == 0 && level_ < kMaxLevel) ++level_;
++  } else if (blue.top < player.top) {
++    blue_counted_ = false;
++  }
++}
++
++Game::Input Game::Translate(const RecoveryUI::InputEvent& ev) const {
++  if (ev.type() == RecoveryUI::EVENT_TYPE_TOUCH) {
++    if (status_ == Status::FINISHED) return Input::RESTART;
++    return ev.pos().x() < width_ / 2 ? Input::LEFT : Input::RIGHT;
++  }
++  if (ev.type() != RecoveryUI::EVENT_TYPE_KEY) return Input::NONE;
++
++  switch (ev.key()) {
++    case KEY_BACK:
++    case KEY_ESC:
++    case KEY_BACKSPACE:
++      return Input::EXIT;
++    case KEY_LEFT:
++      return status_ == Status::RUNNING ? Input::LEFT : Input::NONE;
++    case KEY_RIGHT:
++      return status_ == Status::RUNNING ? Input::RIGHT : Input::NONE;
++    // Phones without a back key exit with a volume key from the game over screen.
++    case KEY_VOLUMEUP:
++      return status_ == Status::RUNNING ? Input::LEFT : Input::EXIT;
++    case KEY_VOLUMEDOWN:
++      return status_ == Status::RUNNING ? Input::RIGHT : Input::EXIT;
++    case KEY_POWER:
++    case KEY_ENTER:
++    case KEY_KPENTER:
++    case KEY_SPACE:
++      return status_ == Status::FINISHED ? Input::RESTART : Input::NONE;
++    default:
++      return Input::NONE;
++  }
++}
++
++void Game::Blit(const Image& img, int dx, int dy, bool opaque) {
++  int x0 = std::max(dx, 0), y0 = std::max(dy, 0);
++  int x1 = std::min(dx + img.w, width_), y1 = std::min(dy + img.h, height_);
++  if (x0 >= x1 || y0 >= y1) return;
++  for (int y = y0; y < y1; ++y) {
++    const uint8_t* s = img.at(x0 - dx, y - dy);
++    uint8_t* d = frame_.at(x0, y);
++    if (opaque) {
++      memcpy(d, s, (x1 - x0) * 4);
++      continue;
++    }
++    for (int x = x0; x < x1; ++x, s += 4, d += 4) {
++      unsigned a = s[3];
++      if (a == 255) {
++        memcpy(d, s, 4);
++      } else if (a != 0) {
++        for (int c = 0; c < 3; ++c) d[c] = (s[c] * a + d[c] * (255 - a)) / 255;
++      }
++    }
++  }
++}
++
++void Game::Render() {
++  if (status_ == Status::FINISHED) {
++    gr_color(0, 0, 0, 255);
++    gr_clear();
++    const GRFont* font = gr_menu_font();
++    int cw, ch;
++    gr_font_size(font, &cw, &ch);
++    std::vector<std::string> lines = { "Game Over",
++                                       "Score " + std::to_string(score_),
++                                       "",
++                                       "",
++                                       "Tap / Power / Enter",
++                                       "to play again",
++                                       "",
++                                       "Back / Esc / Volume",
++                                       "to exit" };
++    int y = (height_ - static_cast<int>(lines.size()) * ch * 3 / 2) / 2;
++    gr_color(255, 255, 255, 255);
++    for (const auto& line : lines) {
++      if (!line.empty()) gr_text(font, (width_ - gr_measure(font, line.c_str())) / 2, y, line.c_str(), false);
++      y += ch * 3 / 2;
++    }
++    gr_flip();
++    return;
++  }
++
++  int road_y = static_cast<int>(height_ * anim_);
++  for (int s = 0; s < 3; ++s) {
++    const Image& section = road_[s][level_index()];
++    Blit(section, road_x_[s], road_y, true);
++    Blit(section, road_x_[s], road_y - height_, true);
++  }
++  Blit(blue_car_, static_cast<int>(blue_x_), road_y, false);
++  Blit(player_car_,
++       static_cast<int>((width_ - player_car_.w) / 2.0f + dp(player_offset_dp_)),
++       static_cast<int>(height_ - dp(kPlayerBottomPaddingDp) - player_car_.h), false);
++  int button_y = static_cast<int>(height_ - dp(kButtonPadVDp)) - button_left_.h;
++  Blit(button_left_, static_cast<int>(dp(kButtonPadHDp)), button_y, false);
++  Blit(button_right_, width_ - static_cast<int>(dp(kButtonPadHDp)) - button_right_.w, button_y,
++       false);
++  Present();
++
++  // Dashboard: black box at the top left with score and level.
++  const GRFont* font = gr_menu_font();
++  int cw, ch;
++  gr_font_size(font, &cw, &ch);
++  std::string lines[4] = { "Score", std::to_string(score_), "Level", std::to_string(level_) };
++  int text_w = 0;
++  for (const auto& l : lines) text_w = std::max(text_w, gr_measure(font, l.c_str()));
++  int pad = static_cast<int>(dp(kDashPadDp));
++  gr_color(0, 0, 0, 255);
++  gr_fill(0, 0, text_w + 2 * pad, 4 * ch + ch / 2);
++  gr_color(255, 255, 255, 255);
++  for (int i = 0; i < 4; ++i) gr_text(font, pad, ch / 4 + i * ch, lines[i].c_str(), false);
++  gr_flip();
++}
++
++void Game::Present() {
++#ifdef ROADFIGHTER_BGR
++  for (size_t i = 0; i < frame_.px.size(); i += 4) std::swap(frame_.px[i], frame_.px[i + 2]);
++#endif
++  gr_blit(&surface_, 0, 0, width_, height_, 0, 0);
++}
++
++void Game::Run() {
++  Reset();
++  int64_t last = now_ms();
++  while (true) {
++    int64_t frame_start = now_ms();
++    int64_t dt = std::min<int64_t>(frame_start - last, 100);
++    last = frame_start;
++    if (status_ == Status::RUNNING) Update(dt);
++    Render();
++
++    // Handle input until it's time for the next frame.
++    int64_t deadline = frame_start + kFrameMs;
++    RecoveryUI::InputEvent ev;
++    while (ui_->PollInputEvent(&ev, static_cast<int>(std::max<int64_t>(deadline - now_ms(), 0)))) {
++      Input in = Translate(ev);
++      if (status_ == Status::FINISHED && in != Input::NONE &&
++          now_ms() - finished_at_ms_ < kGameOverInputDelayMs) {
++        continue;  // ignore presses that were meant for steering when the crash happened
++      }
++      switch (in) {
++        case Input::LEFT:
++          player_offset_dp_ -= kPlayerStepDp;
++          break;
++        case Input::RIGHT:
++          player_offset_dp_ += kPlayerStepDp;
++          break;
++        case Input::RESTART:
++          Reset();
++          last = now_ms();
++          break;
++        case Input::EXIT:
++          return;
++        case Input::NONE:
++          break;
++      }
++    }
++  }
++}
++
++}  // namespace
++
++void run_road_fighter(RecoveryUI* ui) {
++  srand(static_cast<unsigned>(now_ms()));
++  Game game(ui);
++  if (!game.Init()) {
++    ui->Print("Road Fighter: couldn't load the game images from %s\n", kResDir);
++    return;
++  }
++  ui->SetBackground(RecoveryUI::NONE);
++  ui->SetProgressType(RecoveryUI::EMPTY);
++  ui->FlushKeys();
++  game.Run();
++  ui->FlushKeys();
++}
+diff --git a/roadfighter/roadfighter.h b/roadfighter/roadfighter.h
+new file mode 100644
+index 00000000..32ddc343
+--- /dev/null
++++ b/roadfighter/roadfighter.h
+@@ -0,0 +1,14 @@
++/*
++ * Road Fighter: a port of https://github.com/kaiwalyakhasnis/Road-Fighter-Compose to recovery.
++ */
++
++#ifndef RECOVERY_ROADFIGHTER_H
++#define RECOVERY_ROADFIGHTER_H
++
++class RecoveryUI;
++
++// Takes over the screen and runs the game until the player exits (Back / Esc, or a volume key on
++// the game over screen). Assets are loaded from /etc/roadfighter.
++void run_road_fighter(RecoveryUI* ui);
++
++#endif  // RECOVERY_ROADFIGHTER_H
+diff --git a/roadfighter/tools/vec2png.py b/roadfighter/tools/vec2png.py
+new file mode 100644
+index 00000000..0b3063ab
+--- /dev/null
++++ b/roadfighter/tools/vec2png.py
+@@ -0,0 +1,45 @@
++"""Rasterize the game's pixel-art VectorDrawables (rectilinear M/L/Z paths) exactly, nonzero fill rule."""
++import re, sys, xml.etree.ElementTree as ET
++from PIL import Image
++A = '{http://schemas.android.com/apk/res/android}'
++
++def subpaths(d):
++    polys, cur = [], []
++    for cmd, args in re.findall(r'([MLZz])([^MLZz]*)', d):
++        nums = [float(n) for n in re.findall(r'-?[\d.]+', args)]
++        if cmd == 'M':
++            if cur: polys.append(cur)
++            cur = [tuple(nums[0:2])]
++            nums = nums[2:]
++        if cmd in 'ML':
++            cur += [tuple(nums[i:i+2]) for i in range(0, len(nums), 2)]
++        if cmd in 'Zz' and cur:
++            polys.append(cur); cur = []
++    if cur: polys.append(cur)
++    return polys
++
++def winding(polys, x, y):
++    w = 0
++    for p in polys:
++        for (x0, y0), (x1, y1) in zip(p, p[1:] + p[:1]):
++            if y0 <= y < y1 and x < x0 + (y - y0) * (x1 - x0) / (y1 - y0): w += 1
++            elif y1 <= y < y0 and x < x0 + (y - y0) * (x1 - x0) / (y1 - y0): w -= 1
++    return w
++
++src, dst, out_w, out_h = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
++v = ET.parse(src).getroot()
++vw, vh = float(v.get(A + 'viewportWidth')), float(v.get(A + 'viewportHeight'))
++paths = []
++for p in v.iter('path'):
++    c = p.get(A + 'fillColor').lstrip('#')
++    c = c[-6:]
++    paths.append(((int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), 255), subpaths(p.get(A + 'pathData'))))
++img = Image.new('RGBA', (out_w, out_h), (0, 0, 0, 0))
++px = img.load()
++for j in range(out_h):
++    for i in range(out_w):
++        x, y = (i + 0.5) * vw / out_w, (j + 0.5) * vh / out_h
++        for color, polys in paths:
++            if winding(polys, x, y) != 0:
++                px[i, j] = color
++img.save(dst)
+diff --git a/ui.cpp b/ui.cpp
+index ee91caed..5889d585 100644
+--- a/ui.cpp
++++ b/ui.cpp
+@@ -586,6 +586,32 @@ RecoveryUI::InputEvent RecoveryUI::WaitInputEvent() {
+   return event;
+ }
+ 
++bool RecoveryUI::PollInputEvent(InputEvent* event, int timeout_ms) {
++  pthread_mutex_lock(&event_queue_mutex);
++
++  if (event_queue_len == 0 && timeout_ms > 0) {
++    struct timeval now;
++    struct timespec timeout;
++    gettimeofday(&now, nullptr);
++    long long nsec = now.tv_usec * 1000LL + timeout_ms * 1000000LL;
++    timeout.tv_sec = now.tv_sec + nsec / 1000000000LL;
++    timeout.tv_nsec = nsec % 1000000000LL;
++
++    int rc = 0;
++    while (event_queue_len == 0 && rc != ETIMEDOUT) {
++      rc = pthread_cond_timedwait(&event_queue_cond, &event_queue_mutex, &timeout);
++    }
++  }
++
++  bool got = event_queue_len > 0;
++  if (got) {
++    *event = event_queue[0];
++    memcpy(&event_queue[0], &event_queue[1], sizeof(event_queue[0]) * --event_queue_len);
++  }
++  pthread_mutex_unlock(&event_queue_mutex);
++  return got;
++}
++
+ void RecoveryUI::CancelWaitKey()
+ {
+     pthread_mutex_lock(&event_queue_mutex);
+diff --git a/ui.h b/ui.h
+index eddc759b..587c501a 100644
+--- a/ui.h
++++ b/ui.h
+@@ -167,6 +167,11 @@ class RecoveryUI {
+   // Waits for a key and return it. May return -1 after timeout.
+   virtual InputEvent WaitInputEvent();
+ 
++  // Waits up to timeout_ms (0 = don't wait) for a queued key or touch event. Returns false if
++  // none arrived. Unlike WaitInputEvent(), never redraws the screen or dims the backlight, so a
++  // caller that owns the screen (e.g. a game loop) can use it.
++  virtual bool PollInputEvent(InputEvent* event, int timeout_ms);
++
+     // Cancel a WaitKey()
+     virtual void CancelWaitKey();
+ 
+-- 
+2.43.0
+

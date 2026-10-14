@@ -1,0 +1,10 @@
+--- a/drivers/video/simplefb.c
++++ b/drivers/video/simplefb.c
+@@ -84,6 +84,7 @@
+ 
+ static struct simplefb_format simplefb_formats[] = {
+ 	{ "r5g6b5", 16, {11, 5}, {5, 6}, {0, 5}, {0, 0} },
++	{ "a8b8g8r8", 32, {0, 8}, {8, 8}, {16, 8}, {24, 8} },	/* bullhead-qemu: from upstream; minui 8.1 needs 32bpp */
+ };
+ 
+ struct simplefb_params {

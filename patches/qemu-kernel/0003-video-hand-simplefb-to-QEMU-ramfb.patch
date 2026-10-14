@@ -1,0 +1,146 @@
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -168,6 +168,7 @@
+ obj-$(CONFIG_FB_MXS)		  += mxsfb.o
+ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
++obj-$(CONFIG_FB_SIMPLE)           += qemu_ramfb_setup.o	# bullhead-qemu
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
+--- /dev/null
++++ b/drivers/video/qemu_ramfb_setup.c
+@@ -0,0 +1,133 @@
++/*
++ * bullhead-qemu: point QEMU's "ramfb" display device at the simple-framebuffer, so QEMU
++ * shows the guest framebuffer live in its window.  Does nothing unless the device tree
++ * has both a "qemu,fw-cfg-mmio" node and a "simple-framebuffer" node, and QEMU was started
++ * with "-device ramfb".
++ *
++ * fw_cfg MMIO layout (QEMU docs/specs/fw_cfg.rst): data @+0, selector @+8 (be16),
++ * DMA address @+16 (be64, triggered by the write to the low half @+20).
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/delay.h>
++
++#define FW_CFG_FILE_DIR		0x19
++#define FW_CFG_DMA_CTL_ERROR	0x01
++#define FW_CFG_DMA_CTL_SELECT	0x08
++#define FW_CFG_DMA_CTL_WRITE	0x10
++#define DRM_FORMAT_XBGR8888	0x34324258	/* 'XB24': bytes R,G,B,X = simplefb a8b8g8r8 */
++
++struct fw_cfg_dma_access {
++	__be32 control;
++	__be32 length;
++	__be64 address;
++} __packed;
++
++struct ramfb_cfg {
++	__be64 addr;
++	__be32 fourcc;
++	__be32 flags;
++	__be32 width;
++	__be32 height;
++	__be32 stride;
++} __packed;
++
++static void fw_cfg_read(void __iomem *base, void *buf, int len)
++{
++	u8 *p = buf;
++
++	while (len--)
++		*p++ = readb(base);
++}
++
++static int __init qemu_ramfb_setup(void)
++{
++	struct device_node *cfg_np, *fb_np;
++	struct resource cfg_res, fb_res;
++	void __iomem *base;
++	struct fw_cfg_dma_access *dma;
++	struct ramfb_cfg *rcfg;
++	u32 count, i, width, height, stride;
++	u16 sel = 0;
++	phys_addr_t pa;
++	int ret = -ENODEV, tries;
++
++	cfg_np = of_find_compatible_node(NULL, NULL, "qemu,fw-cfg-mmio");
++	fb_np = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
++	if (!cfg_np || !fb_np)
++		goto out_put;
++	if (of_address_to_resource(cfg_np, 0, &cfg_res) ||
++	    of_address_to_resource(fb_np, 0, &fb_res) ||
++	    of_property_read_u32(fb_np, "width", &width) ||
++	    of_property_read_u32(fb_np, "height", &height) ||
++	    of_property_read_u32(fb_np, "stride", &stride))
++		goto out_put;
++
++	base = ioremap(cfg_res.start, resource_size(&cfg_res));
++	if (!base) {
++		ret = -ENOMEM;
++		goto out_put;
++	}
++
++	/* find the "etc/ramfb" file in the fw_cfg directory */
++	writew(cpu_to_be16(FW_CFG_FILE_DIR), base + 8);
++	fw_cfg_read(base, &count, 4);
++	count = be32_to_cpu(count);
++	for (i = 0; i < count; i++) {
++		struct { __be32 size; __be16 select; __be16 reserved; char name[56]; } f;
++
++		fw_cfg_read(base, &f, sizeof(f));
++		if (!strcmp(f.name, "etc/ramfb")) {
++			sel = be16_to_cpu(f.select);
++			break;
++		}
++	}
++	if (!sel) {
++		pr_info("qemu-ramfb: no etc/ramfb (start QEMU with -device ramfb)\n");
++		goto out_unmap;
++	}
++
++	dma = kzalloc(sizeof(*dma) + sizeof(*rcfg), GFP_KERNEL);
++	if (!dma) {
++		ret = -ENOMEM;
++		goto out_unmap;
++	}
++	rcfg = (struct ramfb_cfg *)(dma + 1);
++	rcfg->addr = cpu_to_be64(fb_res.start);
++	rcfg->fourcc = cpu_to_be32(DRM_FORMAT_XBGR8888);
++	rcfg->width = cpu_to_be32(width);
++	rcfg->height = cpu_to_be32(height);
++	rcfg->stride = cpu_to_be32(stride);
++
++	dma->control = cpu_to_be32((u32)sel << 16 | FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE);
++	dma->length = cpu_to_be32(sizeof(*rcfg));
++	dma->address = cpu_to_be64(virt_to_phys(rcfg));
++
++	pa = virt_to_phys(dma);
++	writel(cpu_to_be32((u64)pa >> 32), base + 16);
++	writel(cpu_to_be32((u32)pa), base + 20);
++
++	for (tries = 0; tries < 1000 && (be32_to_cpu(ACCESS_ONCE(dma->control)) & ~FW_CFG_DMA_CTL_ERROR); tries++)
++		udelay(10);
++
++	if (be32_to_cpu(dma->control) & FW_CFG_DMA_CTL_ERROR) {
++		pr_err("qemu-ramfb: fw_cfg DMA write failed\n");
++		ret = -EIO;
++	} else {
++		pr_info("qemu-ramfb: display -> 0x%llx %ux%u stride %u\n",
++			(unsigned long long)fb_res.start, width, height, stride);
++		ret = 0;
++	}
++	kfree(dma);
++out_unmap:
++	iounmap(base);
++out_put:
++	of_node_put(cfg_np);
++	of_node_put(fb_np);
++	return ret;
++}
++late_initcall(qemu_ramfb_setup);

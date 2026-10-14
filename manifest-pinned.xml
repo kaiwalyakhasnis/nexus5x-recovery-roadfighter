@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Revisions the patches in this repo were made against (LineageOS 15.1, bullhead).
+     Use as a local manifest, or just check these commits out. -->
+<manifest>
+  <remote name="github" fetch="https://github.com/" />
+  <project path="bootable/recovery" name="LineageOS/android_bootable_recovery" remote="github"
+           revision="e943962053b46d2621b1a471dc6a9cbfe8acae60" upstream="lineage-15.1" />
+  <project path="kernel/lge/bullhead" name="LineageOS/android_kernel_lge_bullhead" remote="github"
+           revision="65a266ae3d341b04bcf70250c7fa1f28cf687425" upstream="lineage-15.1" />
+</manifest>

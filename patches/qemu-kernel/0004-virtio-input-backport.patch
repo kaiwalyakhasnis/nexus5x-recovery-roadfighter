@@ -1,0 +1,271 @@
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -39,5 +39,6 @@
+ #define VIRTIO_ID_9P		9 /* 9p virtio console */
+ #define VIRTIO_ID_RPROC_SERIAL 11 /* virtio remoteproc serial link */
+ #define VIRTIO_ID_CAIF	       12 /* Virtio caif */
++#define VIRTIO_ID_INPUT		18 /* virtio input (bullhead-qemu backport) */
+ 
+ #endif /* _LINUX_VIRTIO_IDS_H */
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -22,6 +22,13 @@
+ 
+ 	  If unsure, say M.
+ 
++config VIRTIO_INPUT
++	tristate "Virtio input driver (bullhead-qemu backport)"
++	depends on VIRTIO && INPUT
++	---help---
++	 Keyboard, mouse and tablet devices from QEMU's -device virtio-*-device.
++	 Backported from Linux 4.1 for running this kernel under QEMU.
++
+ config VIRTIO_BALLOON
+ 	tristate "Virtio balloon driver"
+ 	depends on VIRTIO
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -2,3 +2,4 @@
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
+ obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
+ obj-$(CONFIG_VIRTIO_BALLOON) += virtio_balloon.o
++obj-$(CONFIG_VIRTIO_INPUT) += virtio_input.o	# bullhead-qemu
+--- /dev/null
++++ b/drivers/virtio/virtio_input.c
+@@ -0,0 +1,236 @@
++/*
++ * bullhead-qemu: virtio-input (keyboard / mouse / tablet) for this 3.10 kernel, so QEMU's
++ * -device virtio-keyboard-device etc. show up as /dev/input/eventN.
++ *
++ * Follows the virtio 1.0 spec (section 5.8) and the structure of the upstream driver added in
++ * Linux 4.1 (drivers/virtio/virtio_input.c), adapted to the 3.10 virtio API (legacy virtio-mmio,
++ * raw config get/set). Only the event queue is used; LED/status output is not supported.
++ */
++
++#include <linux/module.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++#include <linux/input.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/scatterlist.h>
++
++/* struct virtio_input_config layout */
++#define VIRTIO_INPUT_CFG_OFF_SELECT	0
++#define VIRTIO_INPUT_CFG_OFF_SUBSEL	1
++#define VIRTIO_INPUT_CFG_OFF_SIZE	2
++#define VIRTIO_INPUT_CFG_OFF_U		8
++
++enum virtio_input_config_select {
++	VIRTIO_INPUT_CFG_UNSET		= 0x00,
++	VIRTIO_INPUT_CFG_ID_NAME	= 0x01,
++	VIRTIO_INPUT_CFG_ID_SERIAL	= 0x02,
++	VIRTIO_INPUT_CFG_ID_DEVIDS	= 0x03,
++	VIRTIO_INPUT_CFG_PROP_BITS	= 0x10,
++	VIRTIO_INPUT_CFG_EV_BITS	= 0x11,
++	VIRTIO_INPUT_CFG_ABS_INFO	= 0x12,
++};
++
++struct virtio_input_event {
++	__le16 type;
++	__le16 code;
++	__le32 value;
++};
++
++struct virtio_input {
++	struct virtio_device	*vdev;
++	struct input_dev	*idev;
++	char			name[129];
++	char			phys[64];
++	struct virtqueue	*evt;
++	spinlock_t		lock;
++	struct virtio_input_event evts[64];
++};
++
++static void virtinput_queue_evtbuf(struct virtio_input *vi,
++				   struct virtio_input_event *evtbuf)
++{
++	struct scatterlist sg[1];
++
++	sg_init_one(sg, evtbuf, sizeof(*evtbuf));
++	virtqueue_add_inbuf(vi->evt, sg, 1, evtbuf, GFP_ATOMIC);
++}
++
++static void virtinput_recv_events(struct virtqueue *vq)
++{
++	struct virtio_input *vi = vq->vdev->priv;
++	struct virtio_input_event *event;
++	unsigned long flags;
++	unsigned int len;
++
++	spin_lock_irqsave(&vi->lock, flags);
++	while ((event = virtqueue_get_buf(vi->evt, &len)) != NULL) {
++		input_event(vi->idev,
++			    le16_to_cpu(event->type),
++			    le16_to_cpu(event->code),
++			    le32_to_cpu(event->value));
++		virtinput_queue_evtbuf(vi, event);
++	}
++	virtqueue_kick(vq);
++	spin_unlock_irqrestore(&vi->lock, flags);
++}
++
++static u8 virtinput_cfg_select(struct virtio_input *vi, u8 select, u8 subsel)
++{
++	u8 size;
++
++	vi->vdev->config->set(vi->vdev, VIRTIO_INPUT_CFG_OFF_SELECT, &select, 1);
++	vi->vdev->config->set(vi->vdev, VIRTIO_INPUT_CFG_OFF_SUBSEL, &subsel, 1);
++	vi->vdev->config->get(vi->vdev, VIRTIO_INPUT_CFG_OFF_SIZE, &size, 1);
++	return size;
++}
++
++static void virtinput_cfg_bits(struct virtio_input *vi, int select, int subsel,
++			       unsigned long *bits, unsigned int bitcount)
++{
++	unsigned int bit;
++	u8 *virtio_bits;
++	u8 bytes;
++
++	bytes = virtinput_cfg_select(vi, select, subsel);
++	if (!bytes)
++		return;
++	if (bitcount > bytes * 8)
++		bitcount = bytes * 8;
++
++	virtio_bits = kzalloc(bytes, GFP_KERNEL);
++	if (!virtio_bits)
++		return;
++	vi->vdev->config->get(vi->vdev, VIRTIO_INPUT_CFG_OFF_U, virtio_bits, bytes);
++	for (bit = 0; bit < bitcount; bit++) {
++		if (virtio_bits[bit / 8] & (1 << (bit % 8)))
++			__set_bit(bit, bits);
++	}
++	kfree(virtio_bits);
++
++	if (select == VIRTIO_INPUT_CFG_EV_BITS)
++		__set_bit(subsel, vi->idev->evbit);
++}
++
++static void virtinput_cfg_abs(struct virtio_input *vi, int abs)
++{
++	__le32 info[5];	/* min, max, fuzz, flat, res */
++
++	virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ABS_INFO, abs);
++	vi->vdev->config->get(vi->vdev, VIRTIO_INPUT_CFG_OFF_U, info, sizeof(info));
++	input_set_abs_params(vi->idev, abs, le32_to_cpu(info[0]), le32_to_cpu(info[1]),
++			     le32_to_cpu(info[2]), le32_to_cpu(info[3]));
++}
++
++static int virtinput_probe(struct virtio_device *vdev)
++{
++	struct virtio_input *vi;
++	__le16 ids[4];	/* bustype, vendor, product, version */
++	size_t size;
++	int abs, err, i;
++
++	vi = kzalloc(sizeof(*vi), GFP_KERNEL);
++	if (!vi)
++		return -ENOMEM;
++	vdev->priv = vi;
++	vi->vdev = vdev;
++	spin_lock_init(&vi->lock);
++
++	vi->evt = virtio_find_single_vq(vdev, virtinput_recv_events, "events");
++	if (IS_ERR(vi->evt)) {
++		err = PTR_ERR(vi->evt);
++		goto err_free;
++	}
++
++	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ID_NAME, 0);
++	vdev->config->get(vdev, VIRTIO_INPUT_CFG_OFF_U, vi->name,
++			  min(size, sizeof(vi->name) - 1));
++	snprintf(vi->phys, sizeof(vi->phys), "virtio%d/input0", vdev->index);
++
++	vi->idev = input_allocate_device();
++	if (!vi->idev) {
++		err = -ENOMEM;
++		goto err_del_vqs;
++	}
++	input_set_drvdata(vi->idev, vi);
++	vi->idev->name = vi->name;
++	vi->idev->phys = vi->phys;
++
++	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ID_DEVIDS, 0);
++	if (size >= sizeof(ids)) {
++		vdev->config->get(vdev, VIRTIO_INPUT_CFG_OFF_U, ids, sizeof(ids));
++		vi->idev->id.bustype = le16_to_cpu(ids[0]);
++		vi->idev->id.vendor  = le16_to_cpu(ids[1]);
++		vi->idev->id.product = le16_to_cpu(ids[2]);
++		vi->idev->id.version = le16_to_cpu(ids[3]);
++	} else {
++		vi->idev->id.bustype = BUS_VIRTUAL;
++	}
++
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_PROP_BITS, 0, vi->idev->propbit, INPUT_PROP_CNT);
++	if (virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_REP))
++		__set_bit(EV_REP, vi->idev->evbit);
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_KEY, vi->idev->keybit, KEY_CNT);
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_REL, vi->idev->relbit, REL_CNT);
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_ABS, vi->idev->absbit, ABS_CNT);
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_MSC, vi->idev->mscbit, MSC_CNT);
++	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_SW, vi->idev->swbit, SW_CNT);
++
++	if (test_bit(EV_ABS, vi->idev->evbit)) {
++		for (abs = 0; abs < ABS_CNT; abs++) {
++			if (test_bit(abs, vi->idev->absbit))
++				virtinput_cfg_abs(vi, abs);
++		}
++	}
++
++	err = input_register_device(vi->idev);
++	if (err)
++		goto err_free_idev;
++
++	for (i = 0; i < ARRAY_SIZE(vi->evts); i++)
++		virtinput_queue_evtbuf(vi, &vi->evts[i]);
++	virtqueue_kick(vi->evt);
++
++	dev_info(&vdev->dev, "virtio-input: \"%s\"\n", vi->name);
++	return 0;
++
++err_free_idev:
++	input_free_device(vi->idev);
++err_del_vqs:
++	vdev->config->del_vqs(vdev);
++err_free:
++	kfree(vi);
++	return err;
++}
++
++static void virtinput_remove(struct virtio_device *vdev)
++{
++	struct virtio_input *vi = vdev->priv;
++
++	vdev->config->reset(vdev);
++	while (virtqueue_detach_unused_buf(vi->evt) != NULL)
++		;
++	input_unregister_device(vi->idev);
++	vdev->config->del_vqs(vdev);
++	kfree(vi);
++}
++
++static struct virtio_device_id id_table[] = {
++	{ VIRTIO_ID_INPUT, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver virtio_input_driver = {
++	.driver.name	= KBUILD_MODNAME,
++	.driver.owner	= THIS_MODULE,
++	.id_table	= id_table,
++	.probe		= virtinput_probe,
++	.remove		= virtinput_remove,
++};
++
++module_virtio_driver(virtio_input_driver);
++MODULE_DEVICE_TABLE(virtio, id_table);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Virtio input device driver (bullhead-qemu backport)");
