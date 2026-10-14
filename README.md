@@ -1,5 +1,11 @@
 # Road Fighter in the Nexus 5X recovery
 
+<p align="center">
+  <img src="media/demo.gif" alt="Nexus 5X: fastboot boot of the recovery image, Road Fighter starting with recovery, steering, game over and restart" width="480">
+  <br>
+  <sub>Road Fighter in recovery on a Nexus 5X, RAM-booted with <code>fastboot boot</code> (boot sped up 3×, gameplay 1.33×). <a href="media/demo.mp4">Full-quality video</a></sub>
+</p>
+
 [Road-Fighter-Compose](https://github.com/kaiwalyakhasnis/Road-Fighter-Compose), a Jetpack Compose
 game, ported to C++ and built **into LineageOS 15.1 recovery** for the Nexus 5X (bullhead). It
 draws with recovery's own tiny graphics library, **minui**, runs entirely in userspace with no
@@ -8,8 +14,6 @@ Android framework, and starts as soon as recovery boots.
 Also included: a **QEMU setup** that boots the real bullhead kernel and the real recovery ramdisk
 on QEMU's `virt` board, with a live screen and a working keyboard. That's how the game was
 developed and tested.
-
-![recovery menu, gameplay, game over (QEMU)](media/banner.png)
 
 ## What's here
 
@@ -64,6 +68,8 @@ The game is also in **Advanced → Play Road Fighter**. It auto-starts only when
 without a command. OTA installs, wipes and sideloads run as usual.
 
 ## Play it in QEMU
+
+![recovery menu, gameplay, game over in QEMU](media/banner.png)
 
 ```bash
 sudo apt install qemu-system-arm            # QEMU 8.2 tested
