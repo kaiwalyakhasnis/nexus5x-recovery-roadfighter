@@ -93,8 +93,8 @@ and written to the framebuffer through `mmap`.
 
 * QEMU: tested. Menu entry, auto-start, scrolling road, steering, scoring, Game Over, restart and
   exit all checked with QEMU screen captures. `qemu/setup.sh` tested from a clean checkout.
-* Nexus 5X: the image RAM-boots with `fastboot boot`. Levels 2–6 (faster road, tinted verges) and
-  touch steering haven't been checked on a screen capture yet.
+* Nexus 5X: tested on the phone, RAM-booted with `fastboot boot`. The game starts with recovery and
+  plays well.
 
 ## Credits and licenses
 
